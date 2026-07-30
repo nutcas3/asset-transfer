@@ -1,0 +1,59 @@
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: prod
+    restart: unless-stopped
+    ports:
+      - ${PORT}:${PORT}
+    environment:
+      APP_ENV: ${APP_ENV}
+      PORT: ${PORT}
+      ASSET_TRANSFER_DB_HOST: ${ASSET_TRANSFER_DB_HOST}
+      ASSET_TRANSFER_DB_PORT: ${ASSET_TRANSFER_DB_PORT}
+      ASSET_TRANSFER_DB_DATABASE: ${ASSET_TRANSFER_DB_DATABASE}
+      ASSET_TRANSFER_DB_USERNAME: ${ASSET_TRANSFER_DB_USERNAME}
+      ASSET_TRANSFER_DB_PASSWORD: ${ASSET_TRANSFER_DB_PASSWORD}
+      ASSET_TRANSFER_DB_SCHEMA: ${ASSET_TRANSFER_DB_SCHEMA}
+    depends_on:
+      psql_bp:
+        condition: service_healthy
+    networks:
+      - asset-transfer
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: frontend
+    restart: unless-stopped
+    depends_on:
+      - app
+    ports:
+      - 5173:5173
+    networks:
+      - asset-transfer
+  psql_bp:
+    image: postgres:latest
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${ASSET_TRANSFER_DB_DATABASE}
+      POSTGRES_USER: ${ASSET_TRANSFER_DB_USERNAME}
+      POSTGRES_PASSWORD: ${ASSET_TRANSFER_DB_PASSWORD}
+    ports:
+      - "${ASSET_TRANSFER_DB_PORT}:5432"
+    volumes:
+      - psql_volume_at:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "sh -c 'pg_isready -U ${ASSET_TRANSFER_DB_USERNAME} -d ${ASSET_TRANSFER_DB_DATABASE}'"]
+      interval: 5s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    networks:
+      - asset-transfer
+
+volumes:
+  psql_volume_at:
+networks:
+  asset-transfer:
