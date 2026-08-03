@@ -13,11 +13,11 @@ import (
 
 // CircuitBreaker implements a circuit breaker pattern
 type CircuitBreaker struct {
-	mu              sync.RWMutex
-	state           State
-	failureCount    int
-	lastFailureTime time.Time
-	halfOpenSuccess bool
+	mu                    sync.Mutex
+	state                 State
+	failureCount          int
+	lastFailureTime       time.Time
+	halfOpenProbeInFlight bool
 
 	// Configurable values
 	failureThreshold int
@@ -80,8 +80,6 @@ func (cb *CircuitBreaker) WithTimeout(timeout time.Duration) *CircuitBreaker {
 
 // Submit implements GatewayRepository interface with circuit breaker protection
 func (cb *CircuitBreaker) Submit(ctx context.Context, idempotencyKey string, request entities.TransferRequest) (string, error) {
-	log.Printf("[INFO] CircuitBreaker.Submit - idempotency_key=%s, state=%s", idempotencyKey, cb.GetState())
-
 	if !cb.allowRequest() {
 		log.Printf("[WARN] CircuitBreaker.Submit - circuit open, rejecting request: idempotency_key=%s", idempotencyKey)
 		return "", repositories.ErrCircuitOpen
@@ -105,8 +103,8 @@ func (cb *CircuitBreaker) Submit(ctx context.Context, idempotencyKey string, req
 }
 
 func (cb *CircuitBreaker) allowRequest() bool {
-	cb.mu.RLock()
-	defer cb.mu.RUnlock()
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
 
 	switch cb.state {
 	case StateClosed:
@@ -114,18 +112,15 @@ func (cb *CircuitBreaker) allowRequest() bool {
 	case StateOpen:
 		// Check if cooldown period has elapsed
 		if time.Since(cb.lastFailureTime) > cb.cooldownDuration {
-			cb.mu.RUnlock()
-			cb.mu.Lock()
 			cb.state = StateHalfOpen
-			cb.halfOpenSuccess = false
-			cb.mu.Unlock()
-			cb.mu.RLock()
+			cb.halfOpenProbeInFlight = false
 			return true
 		}
 		return false
 	case StateHalfOpen:
 		// Allow exactly one probe call
-		if !cb.halfOpenSuccess {
+		if !cb.halfOpenProbeInFlight {
+			cb.halfOpenProbeInFlight = true
 			return true
 		}
 		return false
@@ -140,6 +135,14 @@ func (cb *CircuitBreaker) recordResult(err error) {
 
 	// Deterministic rejections don't count as failures
 	if errors.Is(err, repositories.ErrGatewayRejected) {
+		// In half-open, a rejection means the gateway is reachable,
+		// so close the circuit but don't reset failure count
+		if cb.state == StateHalfOpen {
+			cb.halfOpenProbeInFlight = false
+			cb.state = StateClosed
+			cb.failureCount = 0
+			log.Printf("[INFO] CircuitBreaker.recordResult - circuit closed after deterministic rejection in half-open")
+		}
 		log.Printf("[INFO] CircuitBreaker.recordResult - deterministic rejection, not counting as failure")
 		return
 	}
@@ -148,7 +151,12 @@ func (cb *CircuitBreaker) recordResult(err error) {
 		cb.failureCount++
 		cb.lastFailureTime = time.Now()
 
-		if cb.failureCount >= cb.failureThreshold {
+		if cb.state == StateHalfOpen {
+			// Failed probe - reopen the circuit
+			cb.state = StateOpen
+			cb.halfOpenProbeInFlight = false
+			log.Printf("[WARN] CircuitBreaker.recordResult - half-open probe failed, circuit reopened")
+		} else if cb.failureCount >= cb.failureThreshold {
 			cb.state = StateOpen
 			log.Printf("[WARN] CircuitBreaker.recordResult - circuit opened: failure_count=%d, threshold=%d", cb.failureCount, cb.failureThreshold)
 		} else {
@@ -157,7 +165,7 @@ func (cb *CircuitBreaker) recordResult(err error) {
 	} else {
 		// Success
 		if cb.state == StateHalfOpen {
-			cb.halfOpenSuccess = true
+			cb.halfOpenProbeInFlight = false
 			cb.state = StateClosed
 			log.Printf("[INFO] CircuitBreaker.recordResult - circuit closed after successful probe")
 		}
@@ -168,8 +176,8 @@ func (cb *CircuitBreaker) recordResult(err error) {
 
 // GetState returns the current circuit breaker state (for testing)
 func (cb *CircuitBreaker) GetState() State {
-	cb.mu.RLock()
-	defer cb.mu.RUnlock()
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
 	return cb.state
 }
 
@@ -179,5 +187,5 @@ func (cb *CircuitBreaker) Reset() {
 	defer cb.mu.Unlock()
 	cb.state = StateClosed
 	cb.failureCount = 0
-	cb.halfOpenSuccess = false
+	cb.halfOpenProbeInFlight = false
 }
